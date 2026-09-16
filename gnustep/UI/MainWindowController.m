@@ -6,6 +6,7 @@
 #import "MainWindowController.h"
 #import "BufferListController.h"
 #import "ChatViewController.h"
+#import "NickListController.h"
 
 #import "QuasselCoreConnection.h"
 #import "BufferInfo.h"
@@ -16,7 +17,8 @@
 // Layout is done with explicit frames and autoresizing masks rather than
 // NSStackView / Auto Layout: gnustep-gui's NSStackView lays out in fixed thirds
 // and its constraint engine is new and lightly tested.
-static const CGFloat kSidebarWidth = 220.0;
+static const CGFloat kSidebarWidth  = 220.0;
+static const CGFloat kNickListWidth = 160.0;
 static const CGFloat kPad          = 16.0;
 static const CGFloat kFieldH       = 24.0;
 static const CGFloat kRowGap       = 10.0;
@@ -39,10 +41,14 @@ static const CGFloat kRowGap       = 10.0;
     NSButton       *_retryButton;
 
     NSToolbar      *_toolbar;
+
+    NSView         *_chatContainer;
+    BOOL            _nickListVisible;
 }
 @property (nonatomic, assign) QuasselUIState state;
 @property (nonatomic, strong) BufferListController *bufferList;
 @property (nonatomic, strong) ChatViewController   *chat;
+@property (nonatomic, strong) NickListController   *nickList;
 @end
 
 
@@ -95,10 +101,22 @@ static const CGFloat kRowGap       = 10.0;
     [_split addSubview:_contentBox];
     [content addSubview:_split];
 
+    // gnustep-gui's NSSplitView does not derive pane widths from subview frames,
+    // so place the divider explicitly.
+    [_split adjustSubviews];
+    [_split setPosition:kSidebarWidth ofDividerAtIndex:0];
+
+    // The member list sits beside the chat log in a plain container rather than
+    // as a third split pane: gnustep-gui's NSSplitView gives a third subview
+    // zero width regardless of its frame or the delegate's sizing answers.
+    // Explicit frames plus autoresizing masks are deterministic here.
+    self.nickList = [[NickListController alloc] initWithWindowController:self];
+
     [self buildLoginView];
     [self buildStatusView];
 
     self.chat = [[ChatViewController alloc] initWithWindowController:self];
+    [self buildChatContainer];
 
     [self buildToolbar];
 }
@@ -215,7 +233,50 @@ static const CGFloat kRowGap       = 10.0;
     [_statusView addSubview:_retryButton];
 }
 
+- (void)buildChatContainer
+{
+    NSRect box = [_contentBox bounds];
+    _chatContainer = [[NSView alloc] initWithFrame:box];
+    [_chatContainer setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+
+    NSView *chatView = [self.chat view];
+    NSView *nickView = [self.nickList view];
+
+    [chatView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    [nickView setAutoresizingMask:NSViewHeightSizable | NSViewMinXMargin];
+
+    [_chatContainer addSubview:chatView];
+    [_chatContainer addSubview:nickView];
+
+    _nickListVisible = YES;
+    [self layoutChatContainer];
+}
+
+- (void)layoutChatContainer
+{
+    NSRect  box = [_chatContainer bounds];
+    CGFloat nw  = _nickListVisible ? kNickListWidth : 0.0;
+
+    [[self.chat view]     setFrame:NSMakeRect(0, 0, box.size.width - nw, box.size.height)];
+    [[self.nickList view] setFrame:NSMakeRect(box.size.width - nw, 0, nw, box.size.height)];
+    [[self.nickList view] setHidden:!_nickListVisible];
+    [_chatContainer setNeedsDisplay:YES];
+}
+
 #pragma mark - State switching
+
+- (void)showWindow:(id)sender
+{
+    [super showWindow:sender];
+    [self resetDividers];
+}
+
+/// Put the buffer-list pane back to its nominal width.
+- (void)resetDividers
+{
+    [_split setPosition:kSidebarWidth ofDividerAtIndex:0];
+    [self layoutChatContainer];
+}
 
 - (void)showState:(QuasselUIState)state
 {
@@ -230,12 +291,13 @@ static const CGFloat kRowGap       = 10.0;
         case QuasselUIStateLogin:      next = _loginView;        break;
         case QuasselUIStateConnecting: next = _statusView;       break;
         case QuasselUIStateError:      next = _statusView;       break;
-        case QuasselUIStateChat:       next = [self.chat view];  break;
+        case QuasselUIStateChat:       next = _chatContainer;    break;
     }
 
     [next setFrame:[_contentBox bounds]];
     [next setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [_contentBox addSubview:next];
+    if (state == QuasselUIStateChat) [self layoutChatContainer];
 
     [_retryButton setHidden:(state != QuasselUIStateError)];
     [self.window setTitle:(state == QuasselUIStateChat) ? @"Quassel" : @"Quassel — Not connected"];
@@ -293,6 +355,7 @@ static const CGFloat kRowGap       = 10.0;
     self.connection.delegate = self;
     [self.bufferList setConnection:self.connection];
     [self.chat       setConnection:self.connection];
+    [self.nickList   setConnection:self.connection];
 
     [self.connection connectTo:host port:port userName:user passWord:password];
 }
@@ -303,24 +366,32 @@ static const CGFloat kRowGap       = 10.0;
     self.connection = nil;
     [self.bufferList setConnection:nil];
     [self.chat setConnection:nil];
+    [self.nickList setConnection:nil];
     [self showState:QuasselUIStateLogin];
 }
 
 - (void)selectBufferId:(id)bufferId
 {
-    [self.chat showBufferId:bufferId];
+    [self.chat     showBufferId:bufferId];
+    [self.nickList showBufferId:bufferId];
+}
+
+- (void)toggleNickList
+{
+    _nickListVisible = !_nickListVisible;
+    [self layoutChatContainer];
 }
 
 #pragma mark - NSToolbarDelegate
 
 - (NSArray *)toolbarAllowedItemIdentifiers:(NSToolbar *)tb
 {
-    return @[@"Connect", @"Disconnect", NSToolbarFlexibleSpaceItemIdentifier];
+    return @[@"Connect", @"Disconnect", NSToolbarFlexibleSpaceItemIdentifier, @"Members"];
 }
 
 - (NSArray *)toolbarDefaultItemIdentifiers:(NSToolbar *)tb
 {
-    return @[@"Connect", @"Disconnect", NSToolbarFlexibleSpaceItemIdentifier];
+    return @[@"Connect", @"Disconnect", NSToolbarFlexibleSpaceItemIdentifier, @"Members"];
 }
 
 - (NSToolbarItem *)toolbar:(NSToolbar *)tb
@@ -334,6 +405,8 @@ static const CGFloat kRowGap       = 10.0;
         [item setAction:@selector(backPressed:)];
     } else if ([ident isEqualToString:@"Disconnect"]) {
         [item setAction:@selector(disconnect)];
+    } else if ([ident isEqualToString:@"Members"]) {
+        [item setAction:@selector(toggleNickList)];
     }
     return item;
 }
@@ -361,7 +434,11 @@ static const CGFloat kRowGap       = 10.0;
     [self.bufferList reload];
 }
 
-- (void)quasselAllNetworkInitReceived { [self.bufferList reload]; }
+- (void)quasselAllNetworkInitReceived
+{
+    [self.bufferList reload];
+    [self.nickList reload];
+}
 
 - (void)quasselFullyConnected
 {
@@ -369,7 +446,11 @@ static const CGFloat kRowGap       = 10.0;
     [self showState:QuasselUIStateChat];
 }
 
-- (void)quasselBufferListUpdated { [self.bufferList reload]; }
+- (void)quasselBufferListUpdated
+{
+    [self.bufferList reload];
+    [self.nickList reload];
+}
 
 - (void)quasselSocketDidDisconnect:(NSString *)msg
 {
@@ -380,7 +461,8 @@ static const CGFloat kRowGap       = 10.0;
 
 - (void)quasselSwitchToBuffer:(BufferId *)bufferId
 {
-    [self.chat showBufferId:bufferId];
+    [self.chat     showBufferId:bufferId];
+    [self.nickList showBufferId:bufferId];
     [self.bufferList selectBufferId:bufferId];
 }
 

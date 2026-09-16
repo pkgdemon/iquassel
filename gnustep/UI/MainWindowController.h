@@ -14,6 +14,7 @@
 @class QuasselCoreConnection;
 @class BufferListController;
 @class ChatViewController;
+@class NickListController;
 
 typedef NS_ENUM(NSInteger, QuasselUIState) {
     QuasselUIStateLogin,
@@ -38,5 +39,8 @@ typedef NS_ENUM(NSInteger, QuasselUIState) {
 
 /// Called by the buffer list when the user picks a buffer.
 - (void)selectBufferId:(id)bufferId;
+
+/// Show/hide the channel member pane.
+- (void)toggleNickList;
 
 @end

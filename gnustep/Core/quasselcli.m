@@ -19,6 +19,8 @@
 #import "SignedId.h"
 #import "Message.h"
 #import "QuasselUtils.h"
+#import "IrcUser.h"
+#import "IrcChannel.h"
 
 static const char *kReset = "\033[0m";
 static const char *kDim   = "\033[2m";
@@ -141,7 +143,26 @@ static void fail(const char *fmt, ...)
                 case QueryBuffer:   kind = "query";   break;
                 default: break;
             }
-            printf("    %s%-9s%s %s\n", kCyan, kind, kReset, info.bufferName.UTF8String);
+            printf("    %s%-9s%s %s", kCyan, kind, kReset, info.bufferName.UTF8String);
+
+            // Same accessor the AppKit member pane uses, so this exercises the
+            // real data path rather than a parallel one.
+            if (info.bufferType == ChannelBuffer) {
+                NSArray *users = [c ircUsersForChannelWithBufferId:bid];
+                if (users.count) {
+                    NSMutableArray *nicks = [NSMutableArray array];
+                    for (IrcUser *u in users) {
+                        [nicks addObject:(u.away
+                            ? [NSString stringWithFormat:@"%@(away)", u.nick]
+                            : (u.nick ?: @"?"))];
+                    }
+                    printf("  %s[%lu: %s]%s", kDim, (unsigned long)users.count,
+                           [[nicks componentsJoinedByString:@" "] UTF8String], kReset);
+                } else {
+                    printf("  %s[no members]%s", kDim, kReset);
+                }
+            }
+            printf("\n");
             total++;
         }
     }
