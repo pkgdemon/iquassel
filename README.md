@@ -7,12 +7,13 @@ from woboq's iQuassel iOS client.
 The protocol layer is iQuassel's, essentially unmodified — it already spoke
 Quassel's Qt `QDataStream`/`QVariant` wire format in pure Objective-C, and that
 turned out to be byte-identical on GNUstep. The iOS interface is gone, replaced
-by a native AppKit one: `NSOutlineView` for the buffer list, `NSTableView` for
-the chat log, one desktop window instead of a navigation stack.
+by a native AppKit one: `NSOutlineView` for the buffer list, `NSTableView` for the
+chat log and the channel member list, one desktop window instead of a
+navigation stack.
 
-> **Status: early.** It connects to a real Quassel core over TLS, authenticates,
-> and lists your networks and buffers. The chat log renders but has had little
-> real-world use. See [Known issues](#known-issues).
+> **Status: early but working.** It connects to a real Quassel core over TLS,
+> authenticates, lists your networks and buffers, renders the chat log and shows
+> channel members. See [Known issues](#known-issues).
 
 ---
 
@@ -128,7 +129,7 @@ python3 gnustep/probecore.py your-core-host 4242
 
 ### Notes for anyone hacking on this
 
-Three things about GNUstep cost real debugging time and are worth knowing:
+Four things about GNUstep cost real debugging time and are worth knowing:
 
 **NSStream cannot do STARTTLS.** gnustep-base installs its TLS handler inside
 `-open` (`GSSocketStream.m:2064`, `+[GSTLSHandler tryInput:output:]`, called
@@ -146,6 +147,12 @@ on Apple platforms; on GNUstep it raises
 `NSCFType does not recognize boolValue`. iQuassel passes exactly that as a TLS
 option, so it must be read defensively.
 
+**`NSSplitView` will not give a third pane any width.** With three subviews,
+gnustep-gui hands the third one zero width regardless of its frame or what the
+delegate's sizing methods answer. The member list is therefore laid out with
+explicit frames inside a container beside the chat log, rather than as a third
+split pane.
+
 **`GSInetOutputStream` starves its sibling.** It signals
 `NSStreamEventHasSpaceAvailable` continuously while the socket is writable,
 monopolising the run loop so `HasBytesAvailable` never arrives. Only relevant if
@@ -155,8 +162,7 @@ you go back to `NSStream`, but it is a nasty one to diagnose.
 
 ## Known issues
 
-- The chat log has had very little real-world use; variable row heights are
-  implemented but lightly tested.
+- Still young; expect rough edges outside the paths described above.
 - Core credentials are stored **in the clear** in `~/Library/Preferences`.
   GNUstep has no Security.framework, so there is no keychain to put them in.
   `libsecret` would be the sensible fix.
@@ -164,7 +170,7 @@ you go back to `NSStream`, but it is a nasty one to diagnose.
   is inherited upstream behaviour (iQuassel sets
   `kCFStreamSSLValidatesCertificateChain: NO`) and is what makes self-signed
   cores work.
-- Nick list, context menus and backlog-on-scroll are not implemented yet.
+- Context menus and backlog-on-scroll are not implemented yet.
 - The client speaks Quassel's legacy `ProtocolVersion 10` handshake. Cores
   still accept it, but the modern probing protocol is not implemented.
 

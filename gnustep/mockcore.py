@@ -59,6 +59,12 @@ def v_list(items):
     return variant(9, u32(len(items)) + b"".join(items))
 
 
+def v_stringlist(strings):
+    """QStringList (type 11). The engine iterates these as NSStrings, so channel
+    membership must use this rather than a QVariantList of QStrings."""
+    return variant(11, u32(len(strings)) + b"".join(qstring(s) for s in strings))
+
+
 def v_map(d):
     """QVariantMap: uint32 count, then (bare QString key, QVariant value)*"""
     out = u32(len(d))
@@ -184,14 +190,43 @@ def session_init():
     }))
 
 
+# Channel membership is derived from the users dict: the engine walks each
+# user's "channels" list and adds them to those IrcChannels. Users are keyed by
+# nick!user@host, as a real core sends them.
+MEMBERS = {
+    1: [
+        ("alice",   ["#gnustep", "#quassel"], False),
+        ("bob",     ["#gnustep"],             False),
+        ("carol",   ["#gnustep", "#quassel"], True),
+        ("dave",    ["#quassel"],             False),
+        ("erin",    ["#gnustep"],             False),
+        ("gnustep-tester", ["#gnustep", "#quassel"], False),
+    ],
+    2: [
+        ("frank",   ["#irc"], False),
+        ("grace",   ["#irc"], False),
+    ],
+}
+
+CHANNELS_PER_NET = {1: ["#gnustep", "#quassel"], 2: ["#irc"]}
+
+
 def network_init_data(net_id):
     users = v_map({
-        "alice": v_map({"nick": v_string("alice")}),
-        "bob":   v_map({"nick": v_string("bob")}),
+        "%s!%s@example.org" % (nick, nick): v_map({
+            "nick":     v_string(nick),
+            "realName": v_string(nick.capitalize()),
+            "away":     v_bool(away),
+            "channels": v_stringlist(chans),
+        })
+        for (nick, chans, away) in MEMBERS.get(net_id, [])
     })
     channels = v_map({
-        "#gnustep": v_map({"name": v_string("#gnustep")}),
-        "#quassel": v_map({"name": v_string("#quassel")}),
+        ch: v_map({
+            "name":  v_string(ch),
+            "topic": v_string("mock channel %s" % ch),
+        })
+        for ch in CHANNELS_PER_NET.get(net_id, [])
     })
     return frame(v_list([
         v_int(INIT_DATA),

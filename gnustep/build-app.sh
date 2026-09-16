@@ -28,7 +28,7 @@ LDFLAGS="-L/System/Library/Libraries \
 ENGINE="QuasselCoreConnection QVariant QBoolean SignedId Message BufferInfo \
         IrcUser IrcChannel QuasselUtils AppState"
 CORE="QuasselSocket"
-UI="QuasselAppDelegate MainWindowController BufferListController ChatViewController main"
+UI="QuasselAppDelegate MainWindowController BufferListController ChatViewController NickListController main"
 
 OBJS=""
 fail=0
