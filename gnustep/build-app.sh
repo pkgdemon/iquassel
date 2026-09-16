@@ -60,16 +60,23 @@ echo "== linking =="
 mkdir -p "$APP/Resources"
 clang -o "$APP/Quassel" $OBJS $LDFLAGS
 
+# App icon. GNUstep reads NSIcon (and ApplicationIcon) from Info-gnustep.plist
+# and resolves it against Resources/, the same way TextEdit.app and Player.app do.
+cp "$GNU/UI/Quassel.png" "$APP/Resources/Quassel.png"
+
 cat > "$APP/Resources/Info-gnustep.plist" <<'PLIST'
 {
     ApplicationName = "Quassel";
     ApplicationDescription = "Quassel IRC client for GNUstep";
+    ApplicationIcon = "Quassel.png";
+    NSIcon = "Quassel.png";
     NSExecutable = "Quassel";
     NSPrincipalClass = "NSApplication";
     NSMainNibFile = "";
     GSMainMarkupFile = "";
     NSMainStoryboardFile = "";
     ApplicationRelease = "0.1";
+    NSRole = "Application";
 }
 PLIST
 
