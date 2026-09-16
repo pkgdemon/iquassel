@@ -12,4 +12,10 @@
 
 + (NSUserDefaults*) preferences;
 
+// Moved here from AppDelegate so that QuasselCoreConnection (the protocol
+// engine) has no dependency on the UI layer. Both already read [AppState
+// preferences]; AppDelegate was only ever a pass-through.
++ (BOOL) isBadgeForHilightsOnly:(BufferId*)bufferId;
++ (BOOL) toggleBadgeForHilightsOnly:(BufferId*)bufferId;
+
 @end

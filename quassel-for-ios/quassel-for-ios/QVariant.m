@@ -1,6 +1,5 @@
 // Dual-Licensed, GPLv3 and Woboq GmbH's private license. See file "LICENSE"
 
-#import "AppDelegate.h"
 #import "QVariant.h"
 #import "BufferInfo.h"  
 #import "Message.h"
@@ -248,7 +247,7 @@
             
             
         } else {
-            NSLog(@"FIXME Unknown user type %s <%@>", userTypeIdentifier, s.base64Encoding);
+            NSLog(@"FIXME Unknown user type %s <%@>", userTypeIdentifier, [s base64EncodedStringWithOptions:0]);
         }
         
         
@@ -257,7 +256,7 @@
         
         *bytesRead = offset;
     } else if (identifier == 7) {
-        //NSLog(@"Deserializing char [FIXME] %@", s.base64Encoding);
+        //NSLog(@"Deserializing char [FIXME] %@", [s base64EncodedStringWithOptions:0]);
 //        int offset = 4 + 1; // int identifier, null byte
 //        int i = CFSwapInt32BigToHost(*(int*)([s bytes] + offset));
 //        int j = (*(int*)([s bytes] + offset));

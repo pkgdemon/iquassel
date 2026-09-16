@@ -16,8 +16,9 @@
 
 + (NSString*) trimStringForConsole:(NSString*)string;
 
-+ (UIColor*) uiColorFromNick:(NSString*)nick;
+// Returns a packed 0xRRGGBB value rather than a UIColor, so the protocol/util
+// layer stays free of any UI framework. The AppKit layer wraps it in NSColor.
++ (uint32_t) rgbFromNick:(NSString*)nick;
 
-#define UIColorFromRGB(rgbValue) [UIColor colorWithRed:((float)((rgbValue & 0xFF0000) >> 16))/255.0 green:((float)((rgbValue & 0xFF00) >> 8))/255.0 blue:((float)(rgbValue & 0xFF))/255.0 alpha:1.0]
 
 @end
