@@ -2,12 +2,42 @@
 //  QuasselSocket.m
 //  Quassel for GNUstep
 //
+//  POSIX socket transport with GNUstep's own TLS layer (GSTLSSession) layered
+//  on when the Quassel handshake calls for STARTTLS.
+//
+//  Why not NSStream: gnustep-base installs its TLS handler inside -open
+//  (GSSocketStream.m:2064, +[GSTLSHandler tryInput:output:], called immediately
+//  before connect()), reading NSStreamSocketSecurityLevelKey at that instant.
+//  Setting the property afterwards is silently ignored -- no handler is ever
+//  installed and nothing re-checks it. Quassel's legacy handshake *requires*
+//  upgrading partway through: ClientInit goes out in the clear and TLS starts
+//  only after ClientInitAck reports SupportSsl. NSStream cannot express that,
+//  and cores refuse a plaintext session outright (verified: UseSsl=false gets
+//  ClientInitReject).
+//
+//  Why not CFStream: libs-corebase has no TLS code at all, and
+//  CFStreamCreatePairWithSocketToHost is an empty function body
+//  (libs-corebase/Source/CFStream.c:336).
+//
+//  So the fd is ours, and GSTLSSession rides on it via push/pull callbacks.
+//  That reuses GNUstep's tested GnuTLS integration rather than hand-rolling
+//  gnutls calls, and honours the usual GSTLS* options.
+//
 
 #import "QuasselSocket.h"
 
-#if defined(GNUSTEP)
-#  import <GNUstepBase/GSTLS.h>
-#endif
+#import <GNUstepBase/GSTLS.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+#include <poll.h>
 
 // Declared in the GCDAsyncSocket compatibility shim. CFNetwork does not exist
 // here, so the key is a plain NSString with the same name.
@@ -15,27 +45,42 @@ NSString * const kCFStreamSSLValidatesCertificateChain = @"kCFStreamSSLValidates
 
 static NSString * const QuasselSocketErrorDomain = @"QuasselSocketErrorDomain";
 
+typedef NS_ENUM(NSInteger, QSState) {
+    QSStateIdle,
+    QSStateConnecting,
+    QSStateConnected,
+    QSStateHandshaking,
+    QSStateSecure,
+    QSStateClosed
+};
+
+// GSTLSSession drives TLS through these; the transport pointer is our fd.
+static ssize_t qs_push(gnutls_transport_ptr_t h, const void *buf, size_t len)
+{
+    return send((int)(intptr_t)h, buf, len, MSG_NOSIGNAL);
+}
+
+static ssize_t qs_pull(gnutls_transport_ptr_t h, void *buf, size_t len)
+{
+    return recv((int)(intptr_t)h, buf, len, 0);
+}
+
+
 @implementation QuasselSocket
 {
-    NSInputStream  *_in;
-    NSOutputStream *_out;
+    int             _fd;
+    QSState         _state;
 
-    NSMutableData  *_writeQueue;     // bytes waiting for space on the output stream
-    BOOL            _wantsRead;      // a readDataWithTimeout: request is outstanding
+    NSMutableData  *_writeQueue;
+    BOOL            _wantsRead;
     long            _readTag;
 
-    BOOL            _connected;
-    BOOL            _didOpen;        // both streams reported NSStreamEventOpenCompleted
-    BOOL            _openCountIn;
-    BOOL            _openCountOut;
-    BOOL            _secure;
-    BOOL            _tlsRequested;
-    BOOL            _closed;
-    BOOL            _outScheduled;   // see _scheduleOutput:
-    NSTimer        *_readPoll;      // see _startReadPoll
+    NSTimer        *_pump;
 
     NSString       *_host;
     uint16_t        _port;
+
+    GSTLSSession   *_tls;
 }
 
 - (instancetype)initWithDelegate:(id)aDelegate
@@ -46,16 +91,15 @@ static NSString * const QuasselSocketErrorDomain = @"QuasselSocketErrorDomain";
         _delegate   = aDelegate;
         _writeQueue = [[NSMutableData alloc] init];
         _readTag    = -1;
+        _fd         = -1;
+        _state      = QSStateIdle;
     }
     return self;
 }
 
 - (void)dealloc
 {
-#ifdef QS_DEBUG
-    NSLog(@"[QS] dealloc");
-#endif
-    [self _teardownStreams];
+    [self _teardown];
 }
 
 #pragma mark - Connect
@@ -65,168 +109,293 @@ static NSString * const QuasselSocketErrorDomain = @"QuasselSocketErrorDomain";
           withTimeout:(NSTimeInterval)timeout
                 error:(NSError **)errPtr
 {
-    if (_in || _out) {
-        if (errPtr) {
-            *errPtr = [NSError errorWithDomain:QuasselSocketErrorDomain code:1
-                       userInfo:@{NSLocalizedDescriptionKey: @"Socket is already connected"}];
-        }
+    if (_fd >= 0) {
+        if (errPtr) *errPtr = [self _errno:EISCONN message:@"Socket is already connected"];
         return NO;
     }
 
-    _host   = [host copy];
-    _port   = port;
-    _closed = NO;
+    _host = [host copy];
+    _port = port;
 
-    NSInputStream  *is = nil;
-    NSOutputStream *os = nil;
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
 
-    NSHost *nsHost = [NSHost hostWithName:host];
-    if (nsHost == nil) {
-        nsHost = [NSHost hostWithAddress:host];
-    }
-    if (nsHost == nil) {
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%u", (unsigned)port);
+
+    int gai = getaddrinfo([host UTF8String], portstr, &hints, &res);
+    if (gai != 0 || res == NULL) {
         if (errPtr) {
-            *errPtr = [NSError errorWithDomain:QuasselSocketErrorDomain code:2
+            *errPtr = [NSError errorWithDomain:QuasselSocketErrorDomain code:gai
                        userInfo:@{NSLocalizedDescriptionKey:
-                                    [NSString stringWithFormat:@"Cannot resolve host %@", host]}];
+                          [NSString stringWithFormat:@"Cannot resolve %@: %s",
+                                    host, gai_strerror(gai)]}];
         }
         return NO;
     }
 
-    [NSStream getStreamsToHost:nsHost
-                          port:(NSInteger)port
-                   inputStream:&is
-                  outputStream:&os];
+    int fd = -1;
+    int lastErr = 0;
+    for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) { lastErr = errno; continue; }
 
-    if (is == nil || os == nil) {
-        if (errPtr) {
-            *errPtr = [NSError errorWithDomain:QuasselSocketErrorDomain code:3
-                       userInfo:@{NSLocalizedDescriptionKey:
-                                    [NSString stringWithFormat:@"Cannot open streams to %@:%u",
-                                                               host, (unsigned)port]}];
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0 || errno == EINPROGRESS) {
+            break;
         }
+        lastErr = errno;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+
+    if (fd < 0) {
+        if (errPtr) *errPtr = [self _errno:lastErr message:
+            [NSString stringWithFormat:@"Cannot connect to %@:%u", host, (unsigned)port]];
         return NO;
     }
 
-    _in  = is;
-    _out = os;
-
-    [_in  setDelegate:self];
-    [_out setDelegate:self];
-
-    [_in scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
-    // NOTE: the output stream is deliberately NOT left scheduled while idle.
-    // GNUstep's GSInetOutputStream signals NSStreamEventHasSpaceAvailable
-    // continuously whenever the socket is writable, which monopolises the run
-    // loop and starves the input stream -- the symptom is that
-    // NSStreamEventHasBytesAvailable never arrives and reads never happen.
-    // It is scheduled on demand in -writeData: and removed again once the
-    // write queue drains.
-    [self _scheduleOutput:YES];
-
-    [_in  open];
-    [_out open];
-
+    _fd    = fd;
+    _state = QSStateConnecting;
+    [self _startPump];
     return YES;
 }
 
 - (void)disconnect
 {
-#ifdef QS_DEBUG
-    NSLog(@"[QS] -disconnect called by engine");
-#endif
-    if (_closed) return;
-    _closed = YES;
-    [self _teardownStreams];
-    _connected = NO;
-    _secure    = NO;
+    if (_state == QSStateClosed) return;
+    _state = QSStateClosed;
+    [self _teardown];
     [self _notifyDisconnected:nil];
 }
 
-- (void)_scheduleOutput:(BOOL)wanted
+- (void)_teardown
 {
-    if (_out == nil || wanted == _outScheduled) return;
-    if (wanted) {
-        [_out scheduleInRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
-    } else {
-        [_out removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
-    }
-    _outScheduled = wanted;
-}
+    [_pump invalidate];
+    _pump = nil;
 
-- (void)_teardownStreams
-{
-    [self _stopReadPoll];
-    if (_in) {
-        [_in setDelegate:nil];
-        [_in removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
-        [_in close];
-        _in = nil;
+    if (_tls) {
+        [_tls disconnect:NO];
+        _tls = nil;
     }
-    if (_out) {
-        [_out setDelegate:nil];
-        if (_outScheduled) {
-            [_out removeFromRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
-            _outScheduled = NO;
-        }
-        [_out close];
-        _out = nil;
+    if (_fd >= 0) {
+        close(_fd);
+        _fd = -1;
     }
 }
 
 #pragma mark - State
 
-- (BOOL)isConnected    { return _connected && !_closed; }
-- (BOOL)isDisconnected { return !_connected || _closed; }
-- (BOOL)isSecure       { return _secure; }
+- (BOOL)isConnected
+{
+    return (_state == QSStateConnected
+            || _state == QSStateHandshaking
+            || _state == QSStateSecure);
+}
+- (BOOL)isDisconnected { return ![self isConnected]; }
+- (BOOL)isSecure       { return (_state == QSStateSecure); }
 
-#pragma mark - IO
+#pragma mark - IO API
 
 - (void)writeData:(NSData *)data withTimeout:(NSTimeInterval)timeout tag:(long)tag
 {
-    if (data.length == 0 || _closed) return;
+    if (data.length == 0 || _state == QSStateClosed) return;
     [_writeQueue appendData:data];
-    [self _scheduleOutput:YES];
-    [self _flushWriteQueue];
+    [self _pumpOnce];
 }
 
 - (void)readDataWithTimeout:(NSTimeInterval)timeout tag:(long)tag
 {
     _wantsRead = YES;
     _readTag   = tag;
-    // Bytes may already be buffered from a previous event, so try immediately
-    // rather than waiting for the next NSStreamEventHasBytesAvailable.
-    [self _drainInput];
+    [self _pumpOnce];
 }
 
-- (void)_flushWriteQueue
-{
-    if (_writeQueue.length == 0 || _out == nil) return;
-    if (![_out hasSpaceAvailable]) return;   // retry on NSStreamEventHasSpaceAvailable
+#pragma mark - TLS
 
-    NSInteger written = [_out write:(const uint8_t *)_writeQueue.bytes
-                          maxLength:_writeQueue.length];
-    if (written > 0) {
-        [_writeQueue replaceBytesInRange:NSMakeRange(0, (NSUInteger)written)
-                               withBytes:NULL length:0];
-    } else if (written < 0) {
-        [self _failWithStreamError:[_out streamError]];
+- (void)startTLS:(NSDictionary *)tlsSettings
+{
+    if (_fd < 0 || _state == QSStateClosed) return;
+
+    // The app passes (id)kCFBooleanFalse here. On Apple platforms CFBoolean
+    // toll-free bridges to NSNumber so -boolValue works; GNUstep's corebase has
+    // no such bridge and raises "NSCFType does not recognize boolValue", so read
+    // it defensively.
+    BOOL validateChain = YES;
+    id validates = [tlsSettings objectForKey:kCFStreamSSLValidatesCertificateChain];
+    if (validates != nil) {
+        if ([validates respondsToSelector:@selector(boolValue)]) {
+            validateChain = [validates boolValue];
+        } else if ((__bridge CFBooleanRef)validates == kCFBooleanFalse) {
+            validateChain = NO;
+        }
+    }
+
+    NSMutableDictionary *opts = [NSMutableDictionary dictionary];
+    // Quassel cores are routinely self-signed and the app deliberately does not
+    // validate the chain -- preserve that rather than inventing a trust policy.
+    [opts setObject:(validateChain ? @"YES" : @"NO") forKey:GSTLSVerify];
+    if (_host.length) {
+        [opts setObject:_host forKey:GSTLSServerName];
+    }
+
+    _tls = [GSTLSSession sessionWithOptions:opts
+                                  direction:YES            // outgoing / client
+                                  transport:(void *)(intptr_t)_fd
+                                       push:qs_push
+                                       pull:qs_pull];
+    if (_tls == nil) {
+        [self _failWithError:[NSError errorWithDomain:QuasselSocketErrorDomain code:-1
+            userInfo:@{NSLocalizedDescriptionKey: @"Could not create a TLS session"}]];
         return;
     }
 
-    // Drained: stop listening for writability so the input stream gets serviced.
-    if (_writeQueue.length == 0) {
-        [self _scheduleOutput:NO];
+    _state = QSStateHandshaking;
+    [self _pumpOnce];
+}
+
+#pragma mark - performBlock
+
+- (void)performBlock:(dispatch_block_t)block
+{
+    if (block) block();
+}
+
+- (NSString *)debugDescription
+{
+    return [NSString stringWithFormat:
+            @"<%@ %p host=%@:%u fd=%d state=%ld secure=%d pendingWrite=%lu>",
+            NSStringFromClass([self class]), self, _host, (unsigned)_port,
+            _fd, (long)_state, (int)[self isSecure],
+            (unsigned long)_writeQueue.length];
+}
+
+#pragma mark - Pump
+//
+// Everything is driven from a run-loop timer rather than dispatch sources, so
+// delegate callbacks land on the run-loop thread the engine already assumes
+// (it marshals with performSelectorOnMainThread: internally).
+
+- (void)_startPump
+{
+    if (_pump) return;
+    _pump = [NSTimer scheduledTimerWithTimeInterval:0.01
+                                             target:self
+                                           selector:@selector(_pumpFired:)
+                                           userInfo:nil
+                                            repeats:YES];
+}
+
+- (void)_pumpFired:(NSTimer *)t { [self _pumpOnce]; }
+
+- (void)_pumpOnce
+{
+    if (_fd < 0 || _state == QSStateClosed) return;
+
+    switch (_state) {
+        case QSStateConnecting:  [self _pumpConnect];   break;
+        case QSStateHandshaking: [self _pumpHandshake]; break;
+        case QSStateConnected:
+        case QSStateSecure:
+            [self _flushWrites];
+            [self _drainInput];
+            break;
+        default:
+            break;
+    }
+}
+
+- (void)_pumpConnect
+{
+    struct pollfd p;
+    p.fd      = _fd;
+    p.events  = POLLOUT;
+    p.revents = 0;
+    if (poll(&p, 1, 0) <= 0) return;
+
+    int       err = 0;
+    socklen_t len = sizeof(err);
+    if (getsockopt(_fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) err = errno;
+
+    if (err != 0) {
+        [self _failWithError:[self _errno:err message:
+            [NSString stringWithFormat:@"Cannot connect to %@:%u", _host, (unsigned)_port]]];
+        return;
+    }
+
+    _state = QSStateConnected;
+    if ([_delegate respondsToSelector:@selector(socket:didConnectToHost:port:)]) {
+        [_delegate socket:self didConnectToHost:_host port:_port];
+    }
+}
+
+- (void)_pumpHandshake
+{
+    // -handshake returns YES when complete, NO when it needs another turn.
+    if (![_tls handshake]) return;
+
+    if (![_tls active]) {
+        NSString *why = [_tls problem];
+        [self _failWithError:[NSError errorWithDomain:QuasselSocketErrorDomain code:-2
+            userInfo:@{NSLocalizedDescriptionKey:
+                (why.length ? why : @"TLS handshake failed")}]];
+        return;
+    }
+
+    _state = QSStateSecure;
+    if ([_delegate respondsToSelector:@selector(socketDidSecure:)]) {
+        [_delegate socketDidSecure:self];
+    }
+    [self _flushWrites];
+    [self _drainInput];
+}
+
+- (BOOL)_wouldBlock
+{
+    return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR);
+}
+
+- (void)_flushWrites
+{
+    while (_writeQueue.length > 0) {
+        NSInteger n;
+        if (_state == QSStateSecure) {
+            n = [_tls write:[_writeQueue bytes] length:[_writeQueue length]];
+        } else {
+            n = send(_fd, [_writeQueue bytes], [_writeQueue length], MSG_NOSIGNAL);
+        }
+
+        if (n > 0) {
+            [_writeQueue replaceBytesInRange:NSMakeRange(0, (NSUInteger)n)
+                                   withBytes:NULL length:0];
+            continue;
+        }
+        if (n == 0 || [self _wouldBlock]) return;   // retry next tick
+
+        [self _failWithError:[self _errno:errno message:@"Write failed"]];
+        return;
     }
 }
 
 - (void)_drainInput
 {
-    if (!_wantsRead || _in == nil) return;
-    if (![_in hasBytesAvailable]) return;
+    if (!_wantsRead) return;
 
     uint8_t buf[16 * 1024];
-    NSInteger n = [_in read:buf maxLength:sizeof(buf)];
+    NSInteger n;
+    if (_state == QSStateSecure) {
+        n = [_tls read:buf length:sizeof(buf)];
+    } else {
+        n = recv(_fd, buf, sizeof(buf), 0);
+    }
 
     if (n > 0) {
         NSData *chunk = [NSData dataWithBytes:buf length:(NSUInteger)n];
@@ -241,170 +410,32 @@ static NSString * const QuasselSocketErrorDomain = @"QuasselSocketErrorDomain";
         if ([_delegate respondsToSelector:@selector(socket:didReadData:withTag:)]) {
             [_delegate socket:self didReadData:chunk withTag:tag];
         }
-    } else if (n < 0) {
-        // GNUstep's GSInetInputStream can report hasBytesAvailable and then
-        // return -1 with no streamError before data has actually arrived.
-        // Treat that as "nothing yet" rather than a fatal error -- failing here
-        // tore the connection down immediately after ClientInit was sent.
-        NSError *err = [_in streamError];
-        if (err != nil) {
-            [self _failWithStreamError:err];
-        }
+        return;
     }
-}
 
-/// GNUstep does not reliably deliver NSStreamEventHasBytesAvailable on a client
-/// socket: the event can simply never arrive even with data waiting. Polling
-/// readability from the run loop is the dependable path, and costs nothing while
-/// idle. Verified against a live socket before adopting.
-- (void)_startReadPoll
-{
-    if (_readPoll) return;
-    _readPoll = [NSTimer scheduledTimerWithTimeInterval:0.02
-                                                 target:self
-                                               selector:@selector(_readPollFired:)
-                                               userInfo:nil
-                                                repeats:YES];
-}
-
-- (void)_stopReadPoll
-{
-    [_readPoll invalidate];
-    _readPoll = nil;
-}
-
-- (void)_readPollFired:(NSTimer *)t
-{
-    if (_closed) { [self _stopReadPoll]; return; }
-    [self _drainInput];
-}
-
-#pragma mark - TLS
-
-- (void)startTLS:(NSDictionary *)tlsSettings
-{
-    if (_in == nil || _out == nil || _closed) return;
-
-    _tlsRequested = YES;
-
-    NSNumber *validates = tlsSettings[kCFStreamSSLValidatesCertificateChain];
-    BOOL wantsValidation = (validates == nil) ? YES : [validates boolValue];
-
-    // Negotiated SSL on an already-open stream pair is GNUstep's STARTTLS.
-    [_in  setProperty:NSStreamSocketSecurityLevelNegotiatedSSL
-               forKey:NSStreamSocketSecurityLevelKey];
-    [_out setProperty:NSStreamSocketSecurityLevelNegotiatedSSL
-               forKey:NSStreamSocketSecurityLevelKey];
-
-#if defined(GNUSTEP)
-    // The app connects to self-signed cores and explicitly disables chain
-    // validation; without this GSTLS refuses the handshake.
-    if (!wantsValidation) {
-        [_in  setProperty:@"NO" forKey:GSTLSVerify];
-        [_out setProperty:@"NO" forKey:GSTLSVerify];
+    if (n == 0) {                       // clean EOF: the core closed
+        [self _failWithError:nil];
+        return;
     }
-    if (_host.length) {
-        [_out setProperty:_host forKey:GSTLSServerName];
-    }
-#endif
+    if ([self _wouldBlock]) return;     // nothing yet
+
+    [self _failWithError:[self _errno:errno message:@"Read failed"]];
 }
 
-- (NSString *)debugDescription
+#pragma mark - Errors
+
+- (NSError *)_errno:(int)e message:(NSString *)msg
 {
-    return [NSString stringWithFormat:
-            @"<%@ %p host=%@:%u connected=%d secure=%d pendingWrite=%lu>",
-            NSStringFromClass([self class]), self, _host, (unsigned)_port,
-            (int)_connected, (int)_secure, (unsigned long)_writeQueue.length];
+    return [NSError errorWithDomain:NSPOSIXErrorDomain code:e
+            userInfo:@{NSLocalizedDescriptionKey:
+                [NSString stringWithFormat:@"%@: %s", msg, strerror(e)]}];
 }
 
-#pragma mark - performBlock
-
-- (void)performBlock:(dispatch_block_t)block
+- (void)_failWithError:(NSError *)err
 {
-    if (block) block();
-}
-
-#pragma mark - NSStreamDelegate
-
-- (void)stream:(NSStream *)stream handleEvent:(NSStreamEvent)event
-{
-#ifdef QS_DEBUG
-    static const char *names[] = {"None","OpenCompleted","HasBytesAvailable",
-                                  "?","HasSpaceAvailable","?","?","?",
-                                  "ErrorOccurred","?","?","?","?","?","?","?","EndEncountered"};
-    NSLog(@"[QS] %s event=%lu (%s) err=%@",
-          (stream == _in ? "IN " : "OUT"), (unsigned long)event,
-          (event < 17 ? names[event] : "?"), [stream streamError]);
-#endif
-    switch (event) {
-
-        case NSStreamEventOpenCompleted: {
-            if (stream == _in)  _openCountIn  = YES;
-            if (stream == _out) _openCountOut = YES;
-
-            if (_openCountIn && _openCountOut && !_didOpen) {
-                _didOpen   = YES;
-                _connected = YES;
-                [self _startReadPoll];
-                if ([_delegate respondsToSelector:@selector(socket:didConnectToHost:port:)]) {
-                    [_delegate socket:self didConnectToHost:_host port:_port];
-                }
-            }
-            break;
-        }
-
-        case NSStreamEventHasBytesAvailable: {
-            [self _checkTLSEstablished];
-            [self _drainInput];
-            break;
-        }
-
-        case NSStreamEventHasSpaceAvailable: {
-            [self _checkTLSEstablished];
-            if (_writeQueue.length > 0) {
-                [self _flushWriteQueue];
-            } else {
-                [self _scheduleOutput:NO];
-            }
-            break;
-        }
-
-        case NSStreamEventErrorOccurred: {
-            [self _failWithStreamError:[stream streamError]];
-            break;
-        }
-
-        case NSStreamEventEndEncountered: {
-            [self _failWithStreamError:nil];
-            break;
-        }
-
-        default:
-            break;
-    }
-}
-
-/// GNUstep performs the TLS handshake inside the stream machinery; the first
-/// readable/writable event after the upgrade means it succeeded.
-- (void)_checkTLSEstablished
-{
-    if (!_tlsRequested || _secure) return;
-    _secure = YES;
-    if ([_delegate respondsToSelector:@selector(socketDidSecure:)]) {
-        [_delegate socketDidSecure:self];
-    }
-}
-
-- (void)_failWithStreamError:(NSError *)err
-{
-#ifdef QS_DEBUG
-    NSLog(@"[QS] _failWithStreamError: %@", err);
-#endif
-    if (_closed) return;
-    _closed    = YES;
-    _connected = NO;
-    _secure    = NO;
-    [self _teardownStreams];
+    if (_state == QSStateClosed) return;
+    _state = QSStateClosed;
+    [self _teardown];
     [self _notifyDisconnected:err];
 }
 
