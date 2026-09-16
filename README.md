@@ -11,9 +11,9 @@ by a native AppKit one: `NSOutlineView` for the buffer list, `NSTableView` for t
 chat log and the channel member list, one desktop window instead of a
 navigation stack.
 
-> **Status: early.** It connects to a real Quassel core over TLS, authenticates,
-> and lists your networks and buffers. The chat log renders but has had little
-> real-world use. See [Known issues](#known-issues).
+> **Status: early but working.** It connects to a real Quassel core over TLS,
+> authenticates, lists your networks and buffers, renders the chat log and shows
+> channel members. See [Known issues](#known-issues).
 
 ---
 
@@ -129,7 +129,7 @@ python3 gnustep/probecore.py your-core-host 4242
 
 ### Notes for anyone hacking on this
 
-Three things about GNUstep cost real debugging time and are worth knowing:
+Four things about GNUstep cost real debugging time and are worth knowing:
 
 **NSStream cannot do STARTTLS.** gnustep-base installs its TLS handler inside
 `-open` (`GSSocketStream.m:2064`, `+[GSTLSHandler tryInput:output:]`, called
@@ -162,8 +162,7 @@ you go back to `NSStream`, but it is a nasty one to diagnose.
 
 ## Known issues
 
-- The chat log has had very little real-world use; variable row heights are
-  implemented but lightly tested.
+- Still young; expect rough edges outside the paths described above.
 - Core credentials are stored **in the clear** in `~/Library/Preferences`.
   GNUstep has no Security.framework, so there is no keychain to put them in.
   `libsecret` would be the sensible fix.
