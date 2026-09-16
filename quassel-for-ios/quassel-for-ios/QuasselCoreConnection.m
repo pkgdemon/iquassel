@@ -10,7 +10,7 @@
 #import "QuasselUtils.h"
 #import "IrcUser.h"
 #import "IrcChannel.h"
-#import "AppDelegate.h"
+#import "AppState.h"
 
 
 @implementation QuasselCoreConnection
@@ -1450,7 +1450,7 @@
             NSLog(@"%@ -> %d", bufferInfo.bufferName, thisBufferCount);
             count += thisBufferCount;
         } else if (bufferInfo.bufferType == ChannelBuffer) {
-            BOOL isBadgeForHilightsOnly = [[AppDelegate instance] isBadgeForHilightsOnly:bufferId];
+            BOOL isBadgeForHilightsOnly = [AppState isBadgeForHilightsOnly:bufferId];
             if (isBadgeForHilightsOnly) {
                 NSNumber *activity = [bufferIdBufferActivityMap objectForKey:bufferId];
                 if (activity && [activity intValue] == BufferActivityHighlight) {

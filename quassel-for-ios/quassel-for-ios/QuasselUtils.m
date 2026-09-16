@@ -112,11 +112,11 @@ unsigned int qChecksum(const char *data , unsigned int len)
 }
 
 // from settings.qss
-+ (UIColor*) uiColorFromNick:(NSString*)nick
++ (uint32_t) rgbFromNick:(NSString*)nick
 {
     nick = [[QuasselUtils extractNick:nick] lowercaseString];
     if (!nick || nick.length == 0) {
-        return UIColorFromRGB(0x000000);
+        return 0x000000;
     }
     // remove _ at end
     while (nick.length > 0 && [nick characterAtIndex:nick.length-1] == '_')
@@ -126,39 +126,39 @@ unsigned int qChecksum(const char *data , unsigned int len)
     int16_t hash = qChecksum(rawNick.bytes, rawNick.length);
     hash = (hash & 0xf)/* + 1*/;
     if (hash == 0x00)
-        return UIColorFromRGB(0xe90d7f);
+        return 0xe90d7f;
     else if (hash == 0x01)
-        return UIColorFromRGB(0x8e55e9);
+        return 0x8e55e9;
     else if (hash == 0x02)
-        return UIColorFromRGB(0xb30e0e);
+        return 0xb30e0e;
     else if (hash == 0x03)
-        return UIColorFromRGB(0x17b339);
+        return 0x17b339;
     else if (hash == 0x04)
-        return UIColorFromRGB(0x58afb3);
+        return 0x58afb3;
     else if (hash == 0x05)
-        return UIColorFromRGB(0x9d54b3);
+        return 0x9d54b3;
     else if (hash == 0x06)
-        return UIColorFromRGB(0xb39775);
+        return 0xb39775;
     else if (hash == 0x07)
-        return UIColorFromRGB(0x3176b3);
+        return 0x3176b3;
     else if (hash == 0x08)
-        return UIColorFromRGB(0xe90d7f);
+        return 0xe90d7f;
     else if (hash == 0x09)
-        return UIColorFromRGB(0x8e55e9);
+        return 0x8e55e9;
     else if (hash == 0x0a)
-        return UIColorFromRGB(0xb30e0e);
+        return 0xb30e0e;
     else if (hash == 0x0b)
-        return UIColorFromRGB(0x17b339);
+        return 0x17b339;
     else if (hash == 0x0c)
-        return UIColorFromRGB(0x58afb3);
+        return 0x58afb3;
     else if (hash == 0x0d)
-        return UIColorFromRGB(0x9d54b3);
+        return 0x9d54b3;
     else if (hash == 0x0e)
-        return UIColorFromRGB(0xb39775);
+        return 0xb39775;
     else if (hash == 0x0f)
-        return UIColorFromRGB(0x3176b3);
+        return 0x3176b3;
     else
-        return UIColorFromRGB(0x000000);
+        return 0x000000;
 }
 
 

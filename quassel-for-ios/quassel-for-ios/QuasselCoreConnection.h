@@ -1,6 +1,5 @@
 // Dual-Licensed, GPLv3 and Woboq GmbH's private license. See file "LICENSE"
 
-#import <UIKit/UIKit.h>
 #import "QuasselCoreConnectionDelegate.h"
 #import "SignedId.h"
 #import "GCDAsyncSocket.h"
