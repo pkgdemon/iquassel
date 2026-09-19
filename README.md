@@ -7,9 +7,9 @@ from woboq's iQuassel iOS client.
 The protocol layer is iQuassel's, essentially unmodified — it already spoke
 Quassel's Qt `QDataStream`/`QVariant` wire format in pure Objective-C, and that
 turned out to be byte-identical on GNUstep. The iOS interface is gone, replaced
-by a native AppKit one: `NSOutlineView` for the buffer list, `NSTableView` for the
-chat log and the channel member list, one desktop window instead of a
-navigation stack.
+by a native AppKit one: `NSOutlineView` for the buffer list, a word-wrapping
+`NSTextView` for the chat log, `NSTableView` for the channel member list, one
+desktop window instead of a navigation stack.
 
 > **Status: early but working.** It connects to a real Quassel core over TLS,
 > authenticates, lists your networks and buffers, renders the chat log and shows
@@ -87,6 +87,9 @@ defaults write Quassel userName yourname
 `gnustep/mockcore.py` is a minimal Quassel core speaking the legacy protocol —
 enough of the handshake to drive the client from `ClientInit` through to a
 populated buffer list. It serves two fake networks and needs no configuration.
+Every buffer gets a short backlog that includes some deliberately over-long
+lines (handy for checking the chat log wraps them), and anything you type is
+echoed back as your own message.
 
 ```sh
 python3 gnustep/mockcore.py 4242 &
@@ -105,7 +108,7 @@ python3 gnustep/probecore.py your-core-host 4242
 ## How it is put together
 
 ```
-   NSOutlineView        NSTableView          NSTextField
+   NSOutlineView        NSTextView           NSTextField
    (buffer list)        (chat log)           (input)
          \                   |                   /
           +---- MainWindowController (NSWindowController) ----+
@@ -129,7 +132,7 @@ python3 gnustep/probecore.py your-core-host 4242
 
 ### Notes for anyone hacking on this
 
-Four things about GNUstep cost real debugging time and are worth knowing:
+Five things about GNUstep cost real debugging time and are worth knowing:
 
 **NSStream cannot do STARTTLS.** gnustep-base installs its TLS handler inside
 `-open` (`GSSocketStream.m:2064`, `+[GSTLSHandler tryInput:output:]`, called
@@ -152,6 +155,12 @@ gnustep-gui hands the third one zero width regardless of its frame or what the
 delegate's sizing methods answer. The member list is therefore laid out with
 explicit frames inside a container beside the chat log, rather than as a third
 split pane.
+
+**`NSTableView` rows are all the same height.** gnustep-gui's `NSTableView`
+never calls `-tableView:heightOfRow:` (`_usesVariableRowHeights` is hard-wired
+to `NO`, and `-noteHeightOfRowsWithIndexesChanged:` is a `FIXME`), and
+`NSCell` draws its text as one vertically centred line. A long message in a
+table row is simply cut off. The chat log is an `NSTextView` for that reason.
 
 **`GSInetOutputStream` starves its sibling.** It signals
 `NSStreamEventHasSpaceAvailable` continuously while the socket is writable,

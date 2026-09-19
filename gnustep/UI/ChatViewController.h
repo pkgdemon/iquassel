@@ -2,9 +2,10 @@
 //  ChatViewController.h
 //  Quassel for GNUstep
 //
-//  The chat log plus input field. Uses NSTableView with
-//  -tableView:heightOfRow:, which is exactly the capability libs-uikit's
-//  UITableView lacks and the reason this port went native.
+//  The chat log plus input field. The log is a read-only NSTextView so long
+//  lines word-wrap and reflow when the window resizes. gnustep-gui's
+//  NSTableView ignores -tableView:heightOfRow: and draws every cell as a single
+//  line, so a table cannot show a wrapped message.
 //
 
 #import <AppKit/AppKit.h>
@@ -14,7 +15,7 @@
 @class MainWindowController;
 @class Message;
 
-@interface ChatViewController : NSObject <NSTableViewDataSource, NSTableViewDelegate>
+@interface ChatViewController : NSObject
 
 @property (nonatomic, weak)   MainWindowController  *windowController;
 @property (nonatomic, strong) QuasselCoreConnection *connection;
