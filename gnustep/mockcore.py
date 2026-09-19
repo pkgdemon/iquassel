@@ -11,6 +11,8 @@ to drive QuasselCoreConnection from ClientInit through to quasselFullyConnected:
     InitRequest(BufferSyncer)      -> InitData(BufferSyncer)
     InitRequest(BufferViewConfig)  -> InitData(BufferViewConfig)
     InitRequest(Network, <id>)     -> InitData(Network)
+    Sync(BacklogManager, requestBacklog) -> Sync(BacklogManager, receiveBacklog)
+    RpcCall(sendInput "/SAY ...")        -> RpcCall(displayMsg)   (echo)
 
 Wire format (Qt QDataStream / QVariant, big-endian throughout):
     frame   := uint32 length, then one QVariant
@@ -90,6 +92,17 @@ def v_bufferinfo(buffer_id, network_id, btype, group_id, name):
     return v_usertype("BufferInfo", payload)
 
 
+def v_message(msg_id, timestamp, mtype, flags, bufinfo, sender, contents):
+    """Message: int32 msgid, uint32 time_t, uint32 type, uint8 flags, bare
+    BufferInfo payload, QByteArray sender, QByteArray contents."""
+    (buffer_id, network_id, btype, name) = bufinfo
+    payload = i32(msg_id) + u32(timestamp) + u32(mtype) + struct.pack(">B", flags) \
+              + i32(buffer_id) + i32(network_id) + struct.pack(">h", btype) \
+              + u32(0) + qbytearray(name) \
+              + qbytearray(sender) + qbytearray(contents)
+    return v_usertype("Message", payload)
+
+
 def frame(v):
     return u32(len(v)) + v
 
@@ -156,6 +169,11 @@ class Reader:
             self.i += n
             if name in ("NetworkId", "IdentityId", "BufferId", "MsgId"):
                 return {name: self.i32()}
+            if name == "BufferInfo":
+                bid, nid = self.i32(), self.i32()
+                self.i += 2                    # int16 type
+                self.u32()                     # group
+                return {name: (bid, nid, self.bytearray_())}
             return {name: None}
         if t == 15:  return self.u32()  # QTime
         raise ValueError("unhandled qvariant type %d" % t)
@@ -265,12 +283,46 @@ def buffer_syncer_init():
     ]))
 
 
+# Backlog. Deliberately includes lines far wider than any window, so the chat
+# log's word wrapping can be checked by eye.
+MSG_PLAIN, MSG_ACTION, MSG_JOIN = 0x01, 0x04, 0x20
+
+BACKLOG = [
+    (MSG_JOIN,   "bob!bob@example.org",     ""),
+    (MSG_PLAIN,  "alice!alice@example.org", "hi all"),
+    (MSG_PLAIN,  "bob!bob@example.org",
+     "this is a deliberately long message to check that the chat log wraps "
+     "onto the next line instead of cutting the text off at the right hand "
+     "edge of the window -- if you can read this whole sentence, including "
+     "the words THE END, then wrapping works. THE END"),
+    (MSG_ACTION, "carol!carol@example.org",
+     "waves and then keeps talking for quite a while, long enough that even "
+     "a maximised window on a wide monitor has to wrap this action line"),
+    (MSG_PLAIN,  "alice!alice@example.org",
+     "a long url with no spaces: https://example.org/" + "a" * 180 + "/END"),
+    (MSG_PLAIN,  "erin!erin@example.org",   "short one after the long ones"),
+]
+
+
+def backlog_for(buffer_id):
+    info = next((b for b in BUFFERS if b[0] == buffer_id), None)
+    if info is None:
+        return []
+    (b, n, t, name) = info
+    base = 1700000000
+    # The core sends newest first; the client reverses the list.
+    return [v_message(buffer_id * 1000 + i, base + i * 60, mtype, 0,
+                      (b, n, t, name), sender, text)
+            for i, (mtype, sender, text) in reversed(list(enumerate(BACKLOG)))]
+
+
 # ---------------------------------------------------------------- server
 
 def handle(conn, addr):
     print("[mockcore] client connected from %s:%d" % addr, flush=True)
     buf = b""
     sent_view_config = False
+    next_msg_id = 900000
 
     try:
         while True:
@@ -340,6 +392,37 @@ def handle(conn, addr):
                             nid = int(objname)
                             conn.sendall(network_init_data(nid))
                             print("[mockcore] -> InitData Network(%d)" % nid, flush=True)
+                    elif req == SYNC and msg[1:4] == ["BacklogManager", "", "requestBacklog"]:
+                        bid = msg[4]["BufferId"]
+                        msgs = backlog_for(bid)
+                        conn.sendall(frame(v_list([
+                            v_int(SYNC),
+                            v_bytearray("BacklogManager"),
+                            v_bytearray(""),
+                            v_bytearray("receiveBacklog"),
+                            v_bufferid(bid),
+                            v_usertype("MsgId", i32(-1)),
+                            v_usertype("MsgId", i32(-1)),
+                            v_int(len(msgs)),
+                            v_int(0),
+                            v_list(msgs),
+                        ])))
+                        print("[mockcore] -> receiveBacklog BufferId(%d): %d messages"
+                              % (bid, len(msgs)), flush=True)
+                    elif req == RPC_CALL and msg[1] == "2sendInput(BufferInfo,QString)":
+                        # Echo /SAY back as our own message, as a real core would.
+                        (bid, _, _) = msg[2]["BufferInfo"]
+                        text = msg[3]
+                        if text.upper().startswith("/SAY "):
+                            info = next(b for b in BUFFERS if b[0] == bid)
+                            next_msg_id += 1
+                            conn.sendall(frame(v_list([
+                                v_int(RPC_CALL),
+                                v_bytearray("2displayMsg(Message)"),
+                                v_message(next_msg_id, 1700009999, MSG_PLAIN, 0x01, info,
+                                          "gnustep-tester!tester@example.org", text[5:]),
+                            ])))
+                            print("[mockcore] -> displayMsg BufferId(%d)" % bid, flush=True)
                     elif req == HEARTBEAT:
                         conn.sendall(frame(v_list([v_int(HEARTBEAT_REPLY), msg[1]])))
     except Exception as e:
