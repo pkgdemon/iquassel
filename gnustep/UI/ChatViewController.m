@@ -15,18 +15,16 @@
 static const CGFloat kInputH   = 26.0;
 static const CGFloat kHPad     = 6.0;
 static const CGFloat kVPad     = 3.0;
-static const CGFloat kMinRowH  = 16.0;
 
 @interface ChatViewController ()
 {
     NSView        *_root;
     NSScrollView  *_scroll;
-    NSTableView   *_table;
+    NSTextView    *_log;
     NSTextField   *_input;
 
-    NSFont        *_font;
-    NSMutableArray *_rows;        // cached NSAttributedString per visible message
-    CGFloat        _lastWidth;    // invalidate heights when the column resizes
+    NSFont          *_font;
+    NSParagraphStyle *_paragraph;
 }
 @property (nonatomic, strong) id currentBufferId;
 @end
@@ -38,8 +36,12 @@ static const CGFloat kMinRowH  = 16.0;
 {
     if ((self = [super init])) {
         _windowController = wc;
-        _rows = [NSMutableArray array];
         _font = [NSFont userFixedPitchFontOfSize:11] ?: [NSFont systemFontOfSize:12];
+
+        NSMutableParagraphStyle *p = [[NSMutableParagraphStyle alloc] init];
+        [p setLineBreakMode:NSLineBreakByWordWrapping];
+        [p setParagraphSpacing:2 * kVPad];
+        _paragraph = p;
         [self buildView];
     }
     return self;
@@ -64,28 +66,35 @@ static const CGFloat kMinRowH  = 16.0;
     [_root addSubview:_input];
 
     // --- chat log filling the rest ---
-    NSRect tableFrame = NSMakeRect(0, kInputH + 1,
-                                   frame.size.width, frame.size.height - kInputH - 1);
+    NSRect logFrame = NSMakeRect(0, kInputH + 1,
+                                 frame.size.width, frame.size.height - kInputH - 1);
 
-    _table = [[NSTableView alloc] initWithFrame:tableFrame];
-    NSTableColumn *col = [[NSTableColumn alloc] initWithIdentifier:@"line"];
-    [col setWidth:tableFrame.size.width - 4];
-    [col setResizingMask:NSTableColumnAutoresizingMask];
-    [_table addTableColumn:col];
-    [_table setHeaderView:nil];
-    [_table setDataSource:self];
-    [_table setDelegate:self];
-    [_table setAllowsMultipleSelection:NO];
-    [_table setAllowsEmptySelection:YES];
-    [_table setUsesAlternatingRowBackgroundColors:NO];
-    [_table setColumnAutoresizingStyle:NSTableViewLastColumnOnlyAutoresizingStyle];
-
-    _scroll = [[NSScrollView alloc] initWithFrame:tableFrame];
-    [_scroll setDocumentView:_table];
+    _scroll = [[NSScrollView alloc] initWithFrame:logFrame];
     [_scroll setHasVerticalScroller:YES];
     [_scroll setHasHorizontalScroller:NO];
     [_scroll setBorderType:NSNoBorder];
     [_scroll setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+
+    // The text container tracks the view's width, so lines rewrap whenever the
+    // window or split view is resized.
+    NSSize content = [_scroll contentSize];
+    _log = [[NSTextView alloc] initWithFrame:
+            NSMakeRect(0, 0, content.width, content.height)];
+    [_log setEditable:NO];
+    [_log setSelectable:YES];
+    [_log setRichText:YES];
+    [_log setDrawsBackground:YES];
+    [_log setBackgroundColor:[NSColor whiteColor]];
+    [_log setTextContainerInset:NSMakeSize(kHPad, kVPad)];
+    [_log setMinSize:NSMakeSize(0, content.height)];
+    [_log setMaxSize:NSMakeSize(FLT_MAX, FLT_MAX)];
+    [_log setVerticallyResizable:YES];
+    [_log setHorizontallyResizable:NO];
+    [_log setAutoresizingMask:NSViewWidthSizable];
+    [[_log textContainer] setContainerSize:NSMakeSize(content.width, FLT_MAX)];
+    [[_log textContainer] setWidthTracksTextView:YES];
+
+    [_scroll setDocumentView:_log];
     [_root addSubview:_scroll];
 }
 
@@ -96,8 +105,7 @@ static const CGFloat kMinRowH  = 16.0;
     _connection = connection;
     if (connection == nil) {
         self.currentBufferId = nil;
-        [_rows removeAllObjects];
-        [_table reloadData];
+        [self rebuildLog];
     }
 }
 
@@ -117,7 +125,7 @@ static const CGFloat kMinRowH  = 16.0;
         [self.connection fetchSomeBacklog:bufferId];
     }
 
-    [self rebuildRows];
+    [self rebuildLog];
     [self scrollToBottom];
 }
 
@@ -127,19 +135,29 @@ static const CGFloat kMinRowH  = 16.0;
     return [self.connection.bufferIdMessageListMap objectForKey:self.currentBufferId] ?: @[];
 }
 
-- (void)rebuildRows
+- (void)rebuildLog
 {
-    [_rows removeAllObjects];
+    NSMutableAttributedString *log = [[NSMutableAttributedString alloc] init];
     for (Message *m in [self currentMessages]) {
-        [_rows addObject:[self attributedLineForMessage:m]];
+        [self appendMessage:m to:log];
     }
-    [_table reloadData];
+    [[_log textStorage] setAttributedString:log];
+}
+
+/// One message per paragraph; every line after the first starts with a newline.
+- (void)appendMessage:(Message *)m to:(NSMutableAttributedString *)log
+{
+    if (log.length > 0) {
+        [log appendAttributedString:
+            [[NSAttributedString alloc] initWithString:@"\n"
+                                            attributes:[self baseAttributes]]];
+    }
+    [log appendAttributedString:[self attributedLineForMessage:m]];
 }
 
 - (void)scrollToBottom
 {
-    NSInteger n = (NSInteger)_rows.count;
-    if (n > 0) [_table scrollRowToVisible:n - 1];
+    [_log scrollRangeToVisible:NSMakeRange([[_log textStorage] length], 0)];
 }
 
 #pragma mark - Incoming messages
@@ -147,7 +165,17 @@ static const CGFloat kMinRowH  = 16.0;
 - (void)messageReceived:(Message *)msg style:(enum ReceiveStyle)style atIndex:(int)index
 {
     if (![[self bufferIdOfMessage:msg] isEqual:self.currentBufferId]) return;
-    [self rebuildRows];
+
+    // A live message lands at the end of the list, so it can be appended
+    // without re-laying out the whole log. Anything else rebuilds.
+    if (style == ReceiveStyleAppended && index == (int)[self currentMessages].count - 1) {
+        NSTextStorage *ts = [_log textStorage];
+        [ts beginEditing];
+        [self appendMessage:msg to:ts];
+        [ts endEditing];
+    } else {
+        [self rebuildLog];
+    }
     if (style == ReceiveStyleAppended) [self scrollToBottom];
 }
 
@@ -155,7 +183,7 @@ static const CGFloat kMinRowH  = 16.0;
 {
     Message *first = messages.firstObject;
     if (first && ![[self bufferIdOfMessage:first] isEqual:self.currentBufferId]) return;
-    [self rebuildRows];
+    [self rebuildLog];
     if (style != ReceiveStyleBacklog) [self scrollToBottom];
 }
 
@@ -209,15 +237,21 @@ static const CGFloat kMinRowH  = 16.0;
                                      alpha:1.0];
 }
 
+- (NSDictionary *)baseAttributes
+{
+    return @{ NSFontAttributeName:            _font,
+              NSParagraphStyleAttributeName:  _paragraph,
+              NSForegroundColorAttributeName: [NSColor blackColor] };
+}
+
 - (NSAttributedString *)attributedLineForMessage:(Message *)message
 {
     NSString *line = [self plainLineForMessage:message];
 
     NSMutableAttributedString *s =
-        [[NSMutableAttributedString alloc] initWithString:line];
+        [[NSMutableAttributedString alloc] initWithString:line
+                                               attributes:[self baseAttributes]];
     NSRange all = NSMakeRange(0, line.length);
-
-    [s addAttribute:NSFontAttributeName value:_font range:all];
 
     // Timestamps in grey.
     NSRange tsRange = [line rangeOfString:@"]"];
@@ -257,53 +291,6 @@ static const CGFloat kMinRowH  = 16.0;
     }
 
     return s;
-}
-
-- (CGFloat)columnTextWidth
-{
-    CGFloat w = [[[_table tableColumns] firstObject] width];
-    return MAX(40.0, w - 2 * kHPad);
-}
-
-#pragma mark - NSTableViewDataSource
-
-- (NSInteger)numberOfRowsInTableView:(NSTableView *)tv
-{
-    return (NSInteger)_rows.count;
-}
-
-- (id)tableView:(NSTableView *)tv
-objectValueForTableColumn:(NSTableColumn *)col
-            row:(NSInteger)row
-{
-    if (row < 0 || row >= (NSInteger)_rows.count) return @"";
-    return _rows[(NSUInteger)row];
-}
-
-#pragma mark - NSTableViewDelegate
-
-/// The whole reason this port is native: message rows are measured individually.
-- (CGFloat)tableView:(NSTableView *)tv heightOfRow:(NSInteger)row
-{
-    if (row < 0 || row >= (NSInteger)_rows.count) return kMinRowH;
-
-    NSAttributedString *s = _rows[(NSUInteger)row];
-    NSRect r = [s boundingRectWithSize:NSMakeSize([self columnTextWidth], 10000)
-                               options:NSStringDrawingUsesLineFragmentOrigin];
-    return MAX(kMinRowH, ceil(r.size.height) + 2 * kVPad);
-}
-
-- (void)tableView:(NSTableView *)tv
-  willDisplayCell:(id)cell
-   forTableColumn:(NSTableColumn *)col
-              row:(NSInteger)row
-{
-    if ([cell isKindOfClass:[NSTextFieldCell class]]) {
-        NSTextFieldCell *tc = (NSTextFieldCell *)cell;
-        [tc setWraps:YES];
-        [tc setLineBreakMode:NSLineBreakByWordWrapping];
-        [tc setFont:_font];
-    }
 }
 
 #pragma mark - Input
